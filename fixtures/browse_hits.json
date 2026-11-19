@@ -1,0 +1,9 @@
+{
+  "batch_id": "B-browse-001",
+  "hits": [
+    {"id": "N1", "visitor_id": "V-2002", "event_ts": "2026-11-18T10:00:00Z", "page_path": "/home", "event_name": "view", "visitor_label": "浏览访客"},
+    {"id": "N2", "visitor_id": "V-2002", "event_ts": "2026-11-18T10:00:40Z", "page_path": "/search", "event_name": "view", "visitor_label": "浏览访客"},
+    {"id": "N3", "visitor_id": "V-2002", "event_ts": "2026-11-18T10:01:20Z", "page_path": "/item/3", "event_name": "click", "visitor_label": "浏览访客"},
+    {"id": "N4", "visitor_id": "V-2002", "event_ts": "2026-11-18T10:02:00Z", "page_path": "/item/3", "event_name": "view", "visitor_label": "浏览访客"}
+  ]
+}
