@@ -46,14 +46,7 @@ def session_detail(conn, session_id: str):
         "session": dict(sess),
         "hits": [dict(h) for h in hits],
         "proof": dict(proof) if proof else None,
-        "landing_split_out": (
-            {**dict(split_out), "event_name": "idle_timeout", "trigger_hit_id": None}
-            if split_out else None
-        ),
-
-        "landing_split_in": (
-            {**dict(split_in), "event_name": "idle_timeout"}
-            if split_in else None
-        ),
-
+        # 切边如实返回：reason / 触发键 / 落地 URL 快照以落库为准，读路径不改写
+        "landing_split_out": dict(split_out) if split_out else None,
+        "landing_split_in": dict(split_in) if split_in else None,
     }

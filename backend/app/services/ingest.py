@@ -145,6 +145,7 @@ def _open_landing_session(conn, *, rule, batch_id, visitor_id, old, hit):
         trigger_hit_id=hit["id"],
         event_name=hit["event_name"],
         event_ts=hit["event_ts"],
+        landing_url=hit["page_path"],
     )
     return sid, "landing"
 

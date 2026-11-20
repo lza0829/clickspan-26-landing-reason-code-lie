@@ -58,7 +58,9 @@ onMounted(load)
           </div>
           <p v-if="details[s.id]?.landing_split_in" class="ok">
             由着陆点 {{ details[s.id].landing_split_in.trigger_hit_id }}
-            （{{ details[s.id].landing_split_in.event_name }}）强制切开，规则版本
+            （{{ details[s.id].landing_split_in.event_name }} →
+            {{ details[s.id].landing_split_in.landing_url }}）强制切开，原因
+            {{ details[s.id].landing_split_in.reason }}，规则版本
             v{{ details[s.id].landing_split_in.rule_version }}
           </p>
           <div class="beads" v-if="details[s.id]">

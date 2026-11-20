@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS landing_rules (
 );
 
 -- 着陆切分边：记录关旧开新的边界及其规则版本（与 landing_rules 快照互证）
+-- reason / landing_url / trigger_hit_id 为不可变快照列：落地闸同事务固化，无改写路径
 CREATE TABLE IF NOT EXISTS landing_splits (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   rule_version INTEGER NOT NULL,
@@ -79,6 +80,8 @@ CREATE TABLE IF NOT EXISTS landing_splits (
   trigger_hit_id TEXT NOT NULL UNIQUE,
   event_name TEXT NOT NULL,
   event_ts TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  landing_url TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 """
@@ -117,6 +120,40 @@ def _migrate(conn):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
     if "landing_rule_version" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN landing_rule_version INTEGER")
+    split_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(landing_splits)").fetchall()
+    }
+    if "reason" not in split_cols:
+        conn.execute(
+            "ALTER TABLE landing_splits ADD COLUMN reason TEXT NOT NULL DEFAULT 'landing_force'"
+        )
+    if "landing_url" not in split_cols:
+        conn.execute(
+            "ALTER TABLE landing_splits ADD COLUMN landing_url TEXT NOT NULL DEFAULT ''"
+        )
+    # 历史快照修复：落地 URL / 事件名一律回填为触发击点本体值（修复原因码撒谎期旧行）
+    conn.execute(
+        """
+        UPDATE landing_splits SET landing_url = (
+          SELECT page_path FROM hits WHERE hits.id = landing_splits.trigger_hit_id
+        )
+        WHERE landing_url = '' AND EXISTS (
+          SELECT 1 FROM hits WHERE hits.id = landing_splits.trigger_hit_id
+        )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE landing_splits SET event_name = (
+          SELECT event_name FROM hits WHERE hits.id = landing_splits.trigger_hit_id
+        )
+        WHERE EXISTS (
+          SELECT 1 FROM hits
+          WHERE hits.id = landing_splits.trigger_hit_id
+            AND hits.event_name != landing_splits.event_name
+        )
+        """
+    )
 
 
 def _seed_fixtures(conn):

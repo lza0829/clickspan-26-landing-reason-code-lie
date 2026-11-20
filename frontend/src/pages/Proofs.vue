@@ -5,6 +5,7 @@ import { api } from '../api.js'
 const rows = ref([])
 const splits = ref([])
 const verify = ref(null)
+const reasonVerify = ref(null)
 const err = ref('')
 
 onMounted(async () => {
@@ -12,6 +13,7 @@ onMounted(async () => {
     rows.value = await api.proofs()
     splits.value = await api.landingSplits()
     verify.value = await api.landingVerify()
+    reasonVerify.value = await api.landingReasonVerify()
   } catch (e) {
     err.value = String(e.message || e)
   }
@@ -34,6 +36,7 @@ onMounted(async () => {
       <thead>
         <tr>
           <th>规则版本</th><th>访客</th><th>触发点</th><th>事件名</th>
+          <th>原因</th><th>落地 URL</th>
           <th>关闭旧会话</th><th>新开会话</th><th>时间</th>
         </tr>
       </thead>
@@ -43,6 +46,8 @@ onMounted(async () => {
           <td>{{ s.visitor_id }}</td>
           <td class="mono">{{ s.trigger_hit_id }}</td>
           <td class="mono">{{ s.event_name }}</td>
+          <td class="mono">{{ s.reason }}</td>
+          <td class="mono">{{ s.landing_url }}</td>
           <td class="mono">{{ s.closed_session_id }}</td>
           <td class="mono">{{ s.new_session_id }}</td>
           <td class="mono">{{ s.event_ts }}</td>
@@ -52,6 +57,31 @@ onMounted(async () => {
     <ul v-if="verify && !verify.ok" class="err">
       <li v-for="(v, i) in verify.violations" :key="i">{{ v.问题 }}（边 #{{ v.id }}）</li>
     </ul>
+
+    <h2>落地原因核证（只读）</h2>
+    <p class="muted">
+      逐条切边核对触发键、落地 URL 与原因码：落地切开必须是落地类码，超时切开不得误标落地。
+    </p>
+    <p v-if="reasonVerify" :class="reasonVerify.ok ? 'ok' : 'err'">
+      {{ reasonVerify.ok
+        ? `原因核对通过：${reasonVerify.edge_count} 条切边 reason / 触发键 / URL 全部一致`
+        : '原因核对发现不一致' }}
+    </p>
+    <table v-if="reasonVerify && reasonVerify.edges.length" class="data">
+      <thead>
+        <tr><th>触发键</th><th>落地 URL</th><th>原因</th><th>结论</th></tr>
+      </thead>
+      <tbody>
+        <tr v-for="e in reasonVerify.edges" :key="e.split_id">
+          <td class="mono">{{ e.trigger_hit_id }}</td>
+          <td class="mono">{{ e.landing_url }}</td>
+          <td class="mono">{{ e.reason }}（{{ e.reason_label }}）</td>
+          <td :class="e.conclusion === 'ok' ? 'ok' : 'err'">
+            {{ e.conclusion === 'ok' ? '一致' : e.problems.join('；') }}
+          </td>
+        </tr>
+      </tbody>
+    </table>
 
     <h2>会话证明</h2>
     <table class="data">

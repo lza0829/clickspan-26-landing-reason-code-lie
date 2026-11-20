@@ -10,6 +10,7 @@ const fixture = ref('landing_hits.json')
 const fixtures = [
   { id: 'landing_hits.json', label: '着陆点夹具（含 landing，间隙仅几十秒）' },
   { id: 'browse_hits.json', label: '普通浏览点夹具（无着陆事件，对照）' },
+  { id: 'idle_gap.json', label: '空闲超时对照夹具（无着陆事件，40 分钟间隙）' },
   { id: 'ingest_batch.json', label: '基座收流夹具' },
 ]
 

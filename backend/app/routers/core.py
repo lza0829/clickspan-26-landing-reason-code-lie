@@ -176,6 +176,16 @@ def landing_verify():
         conn.close()
 
 
+@router.get("/landing/reason-verify")
+def landing_reason_verify(visitor_id: str | None = None):
+    """只读：落地原因核证——逐条切边给出 触发键 / url / reason / 结论。"""
+    conn = connect()
+    try:
+        return landing_svc.verify_reasons(conn, visitor_id)
+    finally:
+        conn.close()
+
+
 def _view_compat_payload(payload: dict) -> dict:
     """读路径字段别名兼容，可与写路径短暂分叉。"""
     out = dict(payload or {})

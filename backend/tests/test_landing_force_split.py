@@ -214,3 +214,145 @@ def test_landing_event_names_not_hardcoded_in_branch_logic():
     assert landing.is_landing("landing", rule) is False
     assert landing.is_landing("other_event", rule) is True
     assert landing.is_landing("landing", None) is False
+
+
+# 9. 落地原因核证（只读接口）：触发键、url、reason、结论 逐边可核
+def test_reason_verify_tracks_reason_trigger_key_and_url(client):
+    client.post("/api/ingest/run", json={"fixture": "landing_hits.json"})
+    res = client.get("/api/landing/reason-verify")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is True
+    assert body["edge_count"] == 2
+    # 原因对照可核：落地类码与超时类码都在对照字典里
+    assert body["reason_codes"]["landing_force"] == "着陆事件强制切窗"
+    assert body["reason_codes"]["idle_timeout"] == "空闲超时切窗"
+    assert body["landing_reason_codes"] == ["landing_force"]
+
+    hits = {h["id"]: h for h in _hits_of("V-9001")}
+    assert {e["trigger_hit_id"] for e in body["edges"]} == {"L3", "L5"}
+    for edge in body["edges"]:
+        assert edge["conclusion"] == "ok"
+        assert edge["problems"] == []
+        # 硬约束：落地切开 reason 必须是落地类码，不得为超时类
+        assert edge["reason"] == "landing_force"
+        assert edge["reason"] != "idle_timeout"
+        # 硬约束：触发键命中当次真实着陆击点
+        hit = hits[edge["trigger_hit_id"]]
+        assert hit["event_name"] == "landing"
+        assert hit["session_id"] == edge["new_session_id"]
+        # 硬约束：URL 快照非空且与触发击点页面一致
+        assert edge["landing_url"]
+        assert edge["landing_url"] == hit["page_path"] == "/lp/a"
+
+
+# 10. 超时切开对照：空闲切窗不得误标落地
+def test_idle_split_not_mislabeled_as_landing(client):
+    res = client.post("/api/ingest/run", json={"fixture": "idle_gap.json"})
+    assert res.json()["report"]["idle_splits"] == 1
+    assert res.json()["report"]["landing_splits"] == 0
+    # 超时切开不落任何着陆切边，原因核证零边通过
+    assert client.get("/api/landing/splits").json() == []
+    rv = client.get("/api/landing/reason-verify").json()
+    assert rv["ok"] is True
+    assert rv["edge_count"] == 0
+    # 被空闲切开的会话详情也不得挂落地切边
+    sessions = _sessions_of("V-9003")
+    assert len(sessions) == 2
+    detail = client.get(f"/api/sessions/{sessions[0]['id']}").json()
+    assert detail["landing_split_out"] is None
+
+
+# 11. 会话详情读路径不撒谎：触发键、reason、url 如实返回
+def test_session_detail_reports_true_reason_and_trigger_key(client):
+    client.post("/api/ingest/run", json={"fixture": "landing_hits.json"})
+    sessions = _sessions_of("V-9001")
+
+    out = client.get(f"/api/sessions/{sessions[0]['id']}").json()["landing_split_out"]
+    assert out["trigger_hit_id"] == "L3"
+    assert out["event_name"] == "landing"
+    assert out["reason"] == "landing_force"
+    assert out["landing_url"] == "/lp/a"
+
+    inc = client.get(f"/api/sessions/{sessions[1]['id']}").json()["landing_split_in"]
+    assert inc["trigger_hit_id"] == "L3"
+    assert inc["event_name"] == "landing"
+    assert inc["reason"] == "landing_force"
+    assert inc["landing_url"] == "/lp/a"
+
+
+# 12. 落地切开而 reason 被改成超时类 → 提交前自检拦下，整批回滚
+def test_precommit_blocks_timeout_reason_on_landing_edge(client, monkeypatch):
+    real_force = landing.force_split
+
+    def tampered(conn, **kw):
+        edge_id = real_force(conn, **kw)
+        conn.execute(
+            "UPDATE landing_splits SET reason='idle_timeout' WHERE id=?", (edge_id,)
+        )
+        return edge_id
+
+    monkeypatch.setattr(ingest.landing_svc, "force_split", tampered)
+    res = client.post("/api/ingest/run", json={"fixture": "landing_hits.json"})
+    assert res.json()["ok"] is False
+
+    conn = connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) c FROM landing_splits").fetchone()["c"] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM sessions WHERE visitor_id='V-9001'"
+        ).fetchone()["c"] == 0
+    finally:
+        conn.close()
+
+
+# 13. URL 快照张冠李戴 → 提交前自检拦下，整批回滚
+def test_precommit_blocks_foreign_landing_url(client, monkeypatch):
+    real_force = landing.force_split
+
+    def tampered(conn, **kw):
+        edge_id = real_force(conn, **kw)
+        conn.execute(
+            "UPDATE landing_splits SET landing_url='/elsewhere' WHERE id=?",
+            (edge_id,),
+        )
+        return edge_id
+
+    monkeypatch.setattr(ingest.landing_svc, "force_split", tampered)
+    res = client.post("/api/ingest/run", json={"fixture": "landing_hits.json"})
+    assert res.json()["ok"] is False
+
+    conn = connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) c FROM landing_splits").fetchone()["c"] == 0
+    finally:
+        conn.close()
+
+
+# 14. 落地闸对撞：快照与当次击点本体不符即拒写（缺一回滚的写路径半边）
+def test_force_split_rejects_snapshot_diverging_from_hit(client):
+    client.post("/api/ingest/run", json={"fixture": "landing_hits.json"})
+    conn = connect()
+    try:
+        rule = landing.active_rule(conn)
+        base = dict(
+            rule=rule, batch_id="B-x", visitor_id="V-9001",
+            old_session_id="s-old", new_session_id="s-new",
+            trigger_hit_id="L3", event_name="landing",
+            event_ts="2026-11-18T09:01:00Z", landing_url="/lp/a",
+        )
+        # 事件名撒谎（写成超时类）
+        with pytest.raises(ValueError):
+            landing.force_split(conn, **{**base, "event_name": "idle_timeout"})
+        # URL 快照为空
+        with pytest.raises(ValueError):
+            landing.force_split(conn, **{**base, "landing_url": ""})
+        # URL 快照张冠李戴
+        with pytest.raises(ValueError):
+            landing.force_split(conn, **{**base, "landing_url": "/other"})
+        # 触发键指向非本访客击点
+        with pytest.raises(ValueError):
+            landing.force_split(conn, **{**base, "trigger_hit_id": "G1"})
+    finally:
+        conn.rollback()
+        conn.close()

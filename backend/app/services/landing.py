@@ -1,12 +1,26 @@
-"""着陆强制切分：规则版本快照 + 切分边，同事务关旧开新。
+"""着陆强制切分：规则版本快照 + 切边不可变原因快照，同事务关旧开新。
 
-规则落库形态：landing_rules 不可变版本快照 + landing_splits 切分边。
+落库形态（择一）：切边行不可变 reason + landing_url + 触发键快照列
+（landing_splits 表），不另立落地原因对照表。
+提交形态（择一）：落地闸同事务写切边并固化原因快照，缺一回滚——
+force_split 与当次击点行对撞，任一不符即抛错，整批事务回滚。
 事件名集合只存在数据库里，代码不写死任何具体事件名。
 """
 import json
 from datetime import datetime, timezone
 
 STATUS = "implemented"
+
+# 切边原因码对照（可核）：落地类码 vs 超时类码。
+# 原因码是切窗类别的闭集枚举，不是事件名；着陆事件名集合仍只存数据库。
+REASON_LANDING_FORCE = "landing_force"
+REASON_IDLE_TIMEOUT = "idle_timeout"
+REASON_CODES = {
+    REASON_LANDING_FORCE: "着陆事件强制切窗",
+    REASON_IDLE_TIMEOUT: "空闲超时切窗",
+}
+LANDING_REASON_CODES = frozenset({REASON_LANDING_FORCE})
+TIMEOUT_REASON_CODES = frozenset({REASON_IDLE_TIMEOUT})
 
 
 def _now() -> str:
@@ -70,14 +84,37 @@ def is_landing(event_name, rule) -> bool:
 
 
 def force_split(conn, *, rule, batch_id, visitor_id, old_session_id,
-                new_session_id, trigger_hit_id, event_name, event_ts) -> int:
-    """同事务内：关闭旧 open、新建会话已由调用方完成，这里只固化切分边。"""
+                new_session_id, trigger_hit_id, event_name, event_ts,
+                landing_url=None) -> int:
+    """落地闸：同事务内固化切边及其不可变原因快照（reason + url + 触发键）。
+
+    快照只认当次触发击点本体：事件名 / 时间 / 落地 URL 与击点行对撞，
+    任一缺失或不符即抛错，调用方整批回滚。硬约束：
+    - 禁止落地切开标成功而 reason 仍为超时类——这里恒写落地类码；
+    - 禁止触发键与真实着陆击点分叉——触发键必须命中本访客击点行；
+    - 禁止 URL 快照空或张冠李戴——必须与触发击点页面一致。
+    """
+    hit = conn.execute(
+        "SELECT * FROM hits WHERE id=? AND visitor_id=?",
+        (trigger_hit_id, visitor_id),
+    ).fetchone()
+    if not hit:
+        raise ValueError(f"触发击点 {trigger_hit_id!r} 不存在，拒绝固化切边")
+    if not is_landing(hit["event_name"], rule):
+        raise ValueError(
+            f"击点 {trigger_hit_id!r} 的事件 {hit['event_name']!r} 不在着陆集合内"
+        )
+    if hit["event_name"] != event_name or hit["event_ts"] != event_ts:
+        raise ValueError("切边快照与触发击点本体不符，拒绝固化")
+    url = landing_url if landing_url is not None else hit["page_path"]
+    if not url or url != hit["page_path"]:
+        raise ValueError("落地 URL 快照为空或与触发击点页面不符")
     cur = conn.execute(
         """
         INSERT INTO landing_splits(
           rule_version, batch_id, visitor_id, closed_session_id, new_session_id,
-          trigger_hit_id, event_name, event_ts, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?)
+          trigger_hit_id, event_name, event_ts, reason, landing_url, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             rule["version"],
@@ -86,8 +123,10 @@ def force_split(conn, *, rule, batch_id, visitor_id, old_session_id,
             old_session_id,
             new_session_id,
             trigger_hit_id,
-            "idle_timeout",
-            event_ts,
+            hit["event_name"],
+            hit["event_ts"],
+            REASON_LANDING_FORCE,
+            url,
             _now(),
         ),
     )
@@ -156,12 +195,78 @@ def verify(conn) -> dict:
     }
 
 
+def verify_reasons(conn, visitor_id: str | None = None) -> dict:
+    """只读落地原因核证：逐条切边核对 触发键 / url / reason，逐边给结论。
+
+    对照 REASON_CODES 字典判类：落地切开的切边 reason 必须是落地类码，
+    触发键必须命中当次真实着陆击点，URL 快照必须与该击点页面一致。
+    """
+    edges = []
+    for edge in list_splits(conn, visitor_id):
+        problems = []
+        reason = edge["reason"]
+        if reason in TIMEOUT_REASON_CODES:
+            problems.append("落地切开而 reason 仍为超时类码")
+        elif reason not in LANDING_REASON_CODES:
+            problems.append(f"reason 不在落地原因对照表内：{reason!r}")
+
+        rule_row = conn.execute(
+            "SELECT * FROM landing_rules WHERE version=?", (edge["rule_version"],)
+        ).fetchone()
+        rule_names = (
+            set(json.loads(rule_row["event_names_json"])) if rule_row else set()
+        )
+
+        hit = conn.execute(
+            "SELECT * FROM hits WHERE id=?", (edge["trigger_hit_id"],)
+        ).fetchone()
+        if not hit:
+            problems.append("触发键未命中任何击点")
+        else:
+            if hit["event_name"] not in rule_names:
+                problems.append("触发键命中的击点不是当次着陆事件")
+            if hit["session_id"] != edge["new_session_id"]:
+                problems.append("触发键与真实着陆击点分叉：击点不在切边新会话")
+            if hit["event_name"] != edge["event_name"]:
+                problems.append("切边事件名快照与触发击点不符")
+            if hit["event_ts"] != edge["event_ts"]:
+                problems.append("切边时间快照与触发击点不符")
+            if not edge["landing_url"]:
+                problems.append("落地 URL 快照为空")
+            elif edge["landing_url"] != hit["page_path"]:
+                problems.append("落地 URL 快照张冠李戴：与触发击点页面不符")
+
+        edges.append({
+            "split_id": edge["id"],
+            "visitor_id": edge["visitor_id"],
+            "closed_session_id": edge["closed_session_id"],
+            "new_session_id": edge["new_session_id"],
+            "trigger_hit_id": edge["trigger_hit_id"],
+            "landing_url": edge["landing_url"],
+            "reason": reason,
+            "reason_label": REASON_CODES.get(reason, "未知原因码"),
+            "conclusion": "ok" if not problems else "fail",
+            "problems": problems,
+        })
+    return {
+        "ok": all(e["conclusion"] == "ok" for e in edges),
+        "edge_count": len(edges),
+        "reason_codes": dict(REASON_CODES),
+        "landing_reason_codes": sorted(LANDING_REASON_CODES),
+        "edges": edges,
+    }
+
+
 def pre_commit_check(conn) -> None:
-    """提交前自检：发现不一致直接抛异常，让整批事务回滚，正式会话不动。"""
-    result = verify(conn)
-    if not result["ok"]:
+    """提交前自检：结构核证 + 落地原因核证，任一不一致即抛错，整批回滚。"""
+    problems = list(verify(conn)["violations"])
+    for edge in verify_reasons(conn)["edges"]:
+        problems += [
+            {"split_id": edge["split_id"], "问题": p} for p in edge["problems"]
+        ]
+    if problems:
         raise RuntimeError("着陆切分一致性自检失败：" + json.dumps(
-            result["violations"], ensure_ascii=False
+            problems, ensure_ascii=False
         ))
 
 

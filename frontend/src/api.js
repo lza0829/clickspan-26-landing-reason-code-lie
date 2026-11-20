@@ -34,4 +34,5 @@ export const api = {
     }),
   landingSplits: () => req('/api/landing/splits'),
   landingVerify: () => req('/api/landing/verify'),
+  landingReasonVerify: () => req('/api/landing/reason-verify'),
 }
